@@ -9,7 +9,7 @@
         }
     },
     "require": {
-        "php": "^8.4",
-        "fast-raven/library": "^1.0"
+        "php": "^8.5",
+        "fast-raven/library": "^1.1"
     }
 }

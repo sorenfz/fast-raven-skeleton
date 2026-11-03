@@ -1,6 +1,6 @@
-/_cert
+/config/env/env.php
+/storage/cache/*
 /storage/logs/*
-.env
-.env.dev
-.env.prod
-env.php
+/storage/uploads/*
+!/storage/*/.gitkeep
+!/storage/uploads/logo.png

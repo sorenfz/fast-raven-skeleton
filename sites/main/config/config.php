@@ -14,7 +14,10 @@ $config->configureRedirects("/", "/", "");
 // Define whether to register logs or restrict what data to register.
 $config->configurePrivacy(true, true);
 
-// Configure rate-limiting per middleware type (VIEW, API, CDN). -1 = disabled.
+// Trust X-Forwarded-For / X-Forwarded-Proto from a reverse proxy you control. false = use the direct connection.
+$config->configureProxy(false);
+
+// Rate limits per authorized user and endpoint type (VIEW, API, CDN), requests per minute. -1 = disabled.
 $config->configureRateLimits(200, 200, 200);
 
 // Configure input/file size limits in KB. -1 = disabled.

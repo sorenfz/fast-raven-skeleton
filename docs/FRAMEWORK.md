@@ -10,10 +10,10 @@
 - **🔒 Security**: Built-in CSRF protection, secure session management, strict CSP with nonces, and automated HSTS headers.
 - **🛣️ Routing**: High-speed O(1) hash map lookup with segregated API, View, and CDN routers.
 - **🎯 Middlewares**: Granular per-endpoint request control for advanced flow management.
-- **🔐 Auth**: Robust session-based authentication with automatic CSRF validation.
-- **📊 Database**: PDO wrapper with prepared statements for ironclad SQL injection protection.
+- **🔐 Auth**: Robust session-based authentication with automatic CSRF validation and per-user rate limiting.
+- **📊 Database**: PDO wrapper with prepared statements, named connections and transactions.
 - **🎨 Templates**: Powerful template engine with view fragments, dynamic data passing, and asset versioning.
-- **🌐 i18n**: Simple CSV-based translations with dynamic language switching per user preference.
+- **🌐 i18n**: CSV-based translations rendered server-side in the client's preferred language, switchable from the frontend.
 - **📧 Email**: Integrated PHPMailer support with HTML templates and easy attachment handling.
 - **📁 Files**: Secure file management with MIME validation via magic bytes and upload limits.
 - **♻️ Caching**: Smart caching layer (APCu → shmop → file) with automatic fallback selection.
@@ -21,7 +21,7 @@
 
 ### Installation
 #### Requirements
-- **PHP** ^8.4
+- **PHP** ^8.5
 - **MySQL** ^8.0
 - **Composer** ^2.9.2
 - **Apache** ^2.4 (or Nginx/IIS with appropriate config)
@@ -48,7 +48,7 @@ graph TD
     H --> I{Site Restricted?}
     I -->|Yes| J{Authorized?}
     J -->|No| K[NotAuthorizedException]
-    I -->|No| N{Rate Limit OK?}
+    I -->|No| N{User Rate Limit OK?}
     J -->|Yes| N
     N -->|No| O[RateLimitExceededException]
     N -->|Yes| P[Kernel::process]
@@ -77,8 +77,8 @@ graph TD
 1. **Server::initialize()** - Validates skeleton structure, loads `.env` files
 2. **Server::configure()** - Creates Kernel with Config, Template, Middleware, and Routers
 3. **Server::run()** - Main execution loop
-4. **Kernel::open()** - Initializes Request, Services/Engines, handles site-level auth
-5. **Kernel::process()** - Rate limiting, route matching, middleware execution, endpoint execution
+4. **Kernel::open()** - Initializes Request, Services/Engines, resolves the page language, applies per-user rate limits, handles site-level auth
+5. **Kernel::process()** - Router rate limits, route matching, middleware execution, endpoint execution
 6. **Kernel::close()** - Sends response, writes logs, garbage collection
 
 
@@ -101,6 +101,7 @@ skeleton/
     ├── src/
     │   ├── api/              API endpoint handlers
     │   ├── cdn/              CDN endpoint handlers
+    │   ├── lib/              Site libraries / repositories (Site\ namespace)
     │   ├── views/            View endpoint handlers
     │   └── web/
     │       ├── templates/    pages/, fragments/, mails/
@@ -109,6 +110,8 @@ skeleton/
     ├── storage/              cache/, logs/, uploads/
     └── index.php             Entry point
 ```
+
+> `ops/deploy.sh` generates an Apache vhost that denies direct access to `config/`, `src/` and `storage/`, so logs, uploads and environment files stay private even if `.htaccess` rewriting is disabled. Replicate that rule on Nginx/IIS.
 
 ---
 
@@ -173,10 +176,14 @@ $config->configureRedirects("/", "/login", "");
 // @param registerOrigin - Log IP addresses
 $config->configurePrivacy(true, true);
 
-// Rate limiting per middleware type (requests per minute, -1 = disabled)
+// Reverse proxy: take client IP and protocol from X-Forwarded-For / X-Forwarded-Proto (only behind a proxy you control)
+$config->configureProxy(false);
+
+// Rate limiting per endpoint type (requests per minute per authorized user, -1 = disabled)
+// Anonymous traffic is not limited: that is the reverse proxy's job.
 $config->configureRateLimits(200, 200, 200);
 
-// Input/file size limits in KB (-1 = disabled)
+// Input/file size limits in KB (-1 = disabled). Bodies above the input limit are answered with 413.
 $config->configureLengthLimits(256, 5120);
 
 // Cache garbage collection
@@ -206,8 +213,9 @@ use FastRaven\Bee;
 // Default template for all views.
 $template = Template::new("main.php", "Fast Raven Site", Bee::env("VERSION", "0.0.1"));
 $template->setLangFile("global")           // CSV file in src/web/assets/lang/
-         ->setDefaultLang("en")            // Default language column
+         ->setDefaultLang("en")            // Fallback when the client prefers no available language
          ->setFavicon("favicon.png")
+         ->addMeta("description", "A site powered by Fast Raven.")
          ->setBeforeFragments(["header.php"])
          ->addStyle("style.css")
          ->addScript("main.js");
@@ -224,7 +232,11 @@ return $template;
 | `setFavicon(favicon)` | Set favicon for both light/dark mode from public/assets/img/ OR external URL (starts with https://) |
 | `setFaviconLight/setFaviconDark(favicon)` | Set mode-specific favicons from public/assets/img/ OR external URL (starts with https://) |
 | `setLangFile(filename)` | Set language CSV file (without .csv extension) |
-| `setDefaultLang(lang)` | Set default language column to use |
+| `setDefaultLang(lang)` | Set the language used when the client prefers none of the available ones |
+| `setLang(lang)` / `getLang()` | Force the page language (e.g., from a user profile) / get the resolved one |
+| `lang(key)` | Translate a key into the page language (fallback: first CSV column, then the key) |
+| `addHead(html)` | Add a raw tag to `<head>` (e.g., canonical link, Open Graph meta) |
+| `addMeta(name, content)` | Add an escaped `<meta name="..." content="...">` tag |
 | `addStyle(style)` | Add CSS file from public/assets/css/ OR external URL (starts with https://) |
 | `addScript(script)` | Add JS file from public/assets/js/ OR external URL (starts with https://) |
 | `setBeforeFragments(array)` | Fragments to render before main content |
@@ -235,15 +247,15 @@ return $template;
 | `setErrorFile(code, file)` | Set custom error page for HTTP status code |
 | `getErrorFile(code)` | Get error page file for status code (default: "errors/generic.php") |
 | `getNonce()` | Get CSP nonce for inline scripts |
-| `merge(?Template)` | Merge another template (overwrites non-empty values) |
+| `merge(?Template)` | Merge another template (overwrites non-empty values, appends head tags, styles, scripts and fragments) |
 
 ---
 
 ### Internationalization (i18n)
 
-FastRaven provides built-in language support using CSV files:
+FastRaven renders every page in the client's preferred language on the backend, so crawlers, emails and the `<html lang>` attribute are right from the first byte. The frontend only handles the user switching language.
 
-**1. Create language file** at `src/web/assets/lang/global.csv`:
+**1. Create language file** at `src/web/assets/lang/global.csv` (the first language column is the fallback for missing keys):
 ```csv
 key,en,es,fr
 WELCOME,Welcome,Bienvenido,Bienvenue
@@ -253,35 +265,37 @@ GOODBYE,Goodbye,Adiós,Au revoir
 **2. Configure template** in `config/template.php`:
 ```php
 $template->setLangFile("global")    // Uses src/web/assets/lang/global.csv
-         ->setDefaultLang("en");    // Default language on page load
+         ->setDefaultLang("en");    // Used when the client prefers none of the available languages
 ```
 
-**3. Use in HTML** with `data-lang` attribute:
-```html
-<span data-lang="WELCOME"></span>
-<p data-lang="GOODBYE"></p>
+**3. Render translations** in page templates, fragments and view handlers:
+```php
+<h1 data-lang="WELCOME"><?= $template->lang("WELCOME") ?></h1>
+<p><?= $template->lang("GOODBYE") ?></p>
 ```
+Keep the `data-lang` attribute on elements that should also switch live from JavaScript; drop it otherwise.
 
-**4. Change language dynamically** via JavaScript:
+**4. Change language from the frontend**:
 ```javascript
-// Switch to Spanish
-Lib.changeLanguage('es');
-
-// Switch to English  
-Lib.changeLanguage('en');
-
-// Check current language
-console.log(window.currentLanguage);  // Currently active language
+Lib.changeLanguage('es');       // Stores the "lang" cookie, swaps [data-lang] elements, updates <html lang>
+console.log(Lib.CURRENT_LANGUAGE);
 ```
 
-**How it works:**
-- On page load, `window.LANG_INTERNAL` is populated with all translations from the CSV
-- The framework automatically restores the user's last selected language from `localStorage` (key: `activeLang`)
-- If no language preference exists, defaults to the language set via `setDefaultLang()`
-- `window.currentLanguage` contains the active language code
-- `Lib.changeLanguage(lang)` updates all `data-lang` elements and persists the choice to `localStorage`
-- **Performance:** Language data is cached for 24 hours to avoid re-parsing the CSV on every request
-- **Persistence:** Language preference survives page reloads and browser sessions
+**How the language is resolved** (first match wins, before any handler runs):
+1. A language explicitly set with `$template->setLang()` (e.g., from the user's profile in the view handler).
+2. The `lang` cookie written by `Lib.changeLanguage()`.
+3. The `Accept-Language` header, by quality.
+4. `setDefaultLang()`.
+
+Outside views, use the same preferences and translations directly:
+```php
+$lang = $request->getPreferredLanguages()[0] ?? "en";   // ["es", "en"] from cookie + Accept-Language
+$text = Bee::lang("WELCOME", $lang);                      // Translate with any language
+$mail->setLang($lang);                                    // Translate {{KEY}} placeholders in a Mail
+```
+
+- Language data is cached for 24 hours (never on dev).
+- Translations are inserted as-is (HTML allowed), exactly like the client-side switch does.
 
 ---
 
@@ -389,7 +403,7 @@ return $cdnRouter;
 - `middlewareId` - Optional ID of middleware to run before endpoint
 
 **Router Constructor:**
-- `Router::new(EndpointType $type, int $limitPerMinute = -1)` - Rate limiting is now set at the router level
+- `Router::new(EndpointType $type, int $limitPerMinute = -1)` - Optional rate limit per authorized user for the whole router
 
 ---
 
@@ -433,6 +447,7 @@ if(Bee::isDev()) {
 - `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASS`: Database credentials
 - `DB_PERSISTENT`: "true" or "false"
 - `DB_SSL`: "true" or "false"
+- `DB_<NAME>_*`: Named connection overrides (e.g., `DB_LOGS_NAME`), missing keys inherit from `DB_*`
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`: Mail credentials
 - `SHMOP_MAX_SIZE`: Max shared memory cache size in KB
 
@@ -478,6 +493,10 @@ $langs = Bee::parseCSV(
     )
 );  // Returns ["en" => ["KEY" => "value"], ...]
 
+// Translations (cached language file, see i18n)
+$text = Bee::lang("WELCOME", "es");          // "Bienvenido" (fallback: first column, then the key)
+$data = Bee::langData("global");             // ["en" => ["WELCOME" => "Welcome"], ...]
+
 // Cache Keys (includes project version for automatic cache invalidation)
 $key = Bee::getCacheKey("session", "user_1"); // → "fastraven:example.com:session:0.0.1:hash"
 ```
@@ -495,7 +514,9 @@ AuthService::createAuthorization($userId, ["role" => "admin"]);
 // Check authorization
 AuthService::isAuthorized($request);      // Includes CSRF check for POST/PUT/DELETE/PATCH
 AuthService::isAuthorized();              // Session only (no CSRF check)
-$userId = AuthService::getAuthorizedUserId();  // int or null
+$userId = AuthService::getAuthorizedUserId();       // int or null
+$customData = AuthService::getAuthorizedUserCustomData();  // array or null
+AuthService::setAuthorizedUserCustomData(["role" => "owner"]);  // Replace custom data, false if not authorized
 
 // Destroy session
 AuthService::destroyAuthorization();
@@ -514,29 +535,41 @@ AuthService::autologin(
 );
 ```
 
-**Session Variables:**
-- `$_SESSION["sgas_uid"]` - User ID
-- `$_SESSION["sgas_custom"]` - Custom data array
-- `$_SESSION["sgas_csrf"]` - CSRF token
+Never read `$_SESSION` directly: the getters and setters above are the supported API.
 
 ---
 
 ### DataService
 
-> ⚠️ Only `Map` values are protected via prepared statements. Never use user input for table/column names.
+> ⚠️ Only `Map` values and `Condition` values are protected via prepared statements. Never use user input for table/column names.
 
 ```php
 use FastRaven\Services\DataService;
-use FastRaven\Components\Data\{Map, ConditionList, Condition, Pair};
-use FastRaven\Types\OperatorType;
+use FastRaven\Components\Data\{Map, ConditionList, Condition};
 
-// Raw SQL (CAREFUL: No SQL protection provided by the framework from hereon!)
-$result = DataService::sql("SELECT * FROM users WHERE id = ?", [$id]);
+// Raw SQL (CAREFUL: only $vars are protected, positional "?" or named ":name")
+$rows = DataService::sql("SELECT * FROM users WHERE id = ?", [$id]);       // Result sets → array of rows
+$affected = DataService::sql("UPDATE users SET active = 0 WHERE id = ?", [$id]); // Other statements → affected row count
+$user = DataService::sqlOne("SELECT * FROM users WHERE email = :email", ["email" => $email]); // First row or null
+$total = DataService::sqlValue("SELECT COUNT(*) FROM users");            // First column of first row or null
+$error = DataService::getLastError();                                     // PDO message of the last failed query, null otherwise
+
+// Transactions: rolled back if the callback returns false, throws, or any query inside fails
+$ok = DataService::transaction(function() use ($order) {
+    DataService::insert("orders", $order);
+    $id = DataService::getLastInsertId();
+    DataService::sql("UPDATE stock SET qty = qty - 1 WHERE product_id = ?", [$order->get("product_id")]);
+});
+
+// Multiple databases: named connections read DB_<NAME>_* env vars (missing keys inherit from DB_*)
+DataService::use("logs");                     // Everything below runs on DB_LOGS_*
+DataService::insert("entries", Map::new(["msg" => "hello"]));
+DataService::use();                           // Back to the default connection
 
 // Read single row
 $user = DataService::selectOneById("users", ["id", "name"], 1);
 $user = DataService::selectOneWhere("users", ["*"], ConditionList::new([
-    Condition::email("email", $email)
+    Condition::equals("email", $email)
 ]));
 
 // Read multiple rows
@@ -551,15 +584,12 @@ $users = DataService::selectWhere(
 $allUsers = DataService::select("users", ["*"], "created_at DESC", 100, 0);
 
 // Joins
-// Simple join
 $join = DataService::join(
     "users",
     ["orders"],
     Map::new(["users.id" => "orders.user_id"]),
     ["users.name", "orders.total"]
 );
-
-// Join with WHERE clauses
 $joinFiltered = DataService::joinWhere(
     "users",
     ["orders"],
@@ -582,13 +612,8 @@ DataService::insertBatch("logs", [
 ]);
 
 // Update
-DataService::updateById("users", 1, Map::new([
-    "name" => "Jane"
-]));
-DataService::updateWhere("users", 
-    Map::new(["active" => 0]),
-    ConditionList::new([Condition::equals("old", 1)])
-);
+DataService::updateById("users", 1, Map::new(["name" => "Jane"]));
+DataService::updateWhere("users", Map::new(["active" => 0]), ConditionList::new([Condition::equals("old", 1)]));
 
 // Delete
 DataService::deleteById("users", 1);
@@ -599,13 +624,25 @@ $count = DataService::count("users", ConditionList::new([Condition::equals("acti
 $exists = DataService::existsById("users", 1);
 ```
 
+**Conditions** (all values are bound as prepared statement parameters; `ConditionList` joins them with `AND`):
+
+| Factory | SQL |
+|---------|-----|
+| `equals(col, v)` / `notEquals(col, v)` | `col = ?` / `col != ?` (booleans bound as 1/0) |
+| `greaterThan` / `lessThan` / `greaterThanOrEqual` / `lessThanOrEqual` | `col > ?` ... |
+| `like(col, v)` / `notLike(col, v)` | `col LIKE ?` / `col NOT LIKE ?` |
+| `in(col, [..])` / `notIn(col, [..])` | `col IN (?, ?)` / `col NOT IN (?, ?)` |
+| `between(col, low, high)` / `notBetween(col, low, high)` | `col BETWEEN ? AND ?` / `col NOT BETWEEN ? AND ?` |
+| `isNull(col)` / `isNotNull(col)` | `col IS NULL` / `col IS NOT NULL` |
+| `is(col, bool\|null)` / `isNot(col, bool\|null)` | `col IS TRUE` / `col IS NOT FALSE` / `col IS NULL` (literals, nothing bound) |
+
 ---
 
 ### ValidationService
 
 ```php
 use FastRaven\Services\ValidationService;
-use FastRaven\Components\Data\ValidationFlags;
+use FastRaven\Types\ValidationType;
 
 // Email validation
 ValidationService::email($email);  // Uses filter_var
@@ -634,7 +671,7 @@ ValidationService::phone($countryCode, $phone);  // 7-15 chars, code 1-999
 
 ### CacheService
 
-Automatically selects best backend: APCu → shmop → file.
+Automatically selects best backend: APCu → shmop → file. Every key is prefixed with the base domain and site name, so sites sharing a backend never collide and `empty()` only clears the current site.
 
 ```php
 use FastRaven\Services\CacheService;
@@ -719,6 +756,9 @@ $mail->setAttachments(Map::new([
 // Optional: Set timeout (default 3000ms)
 $mail->setTimeout(5000);
 
+// Optional: Translate the mail. Any {{KEY}} left in subject/body after setReplaceValues() is looked up in the language file.
+$mail->setLang("es");            // or ->setLang("es", "mails") for src/web/assets/lang/mails.csv
+
 // Send synchronously - blocks until sent, returns success/failure
 MailService::send($mail);
 
@@ -739,7 +779,7 @@ Fire-and-forget emails are processed after `fastcgi_finish_request()`, so the us
 **Mail Templates:**
 - Location: `src/web/templates/mails/`
 - Format: HTML files with placeholder support (e.g., `{{PLACEHOLDER}}`)
-- Placeholders are replaced using `setReplaceValues()`
+- Placeholders are replaced using `setReplaceValues()`, remaining `{{KEY}}` are translated when `setLang()` is set
 
 ---
 
@@ -754,6 +794,8 @@ HeaderService::removeHeader("X-Custom");
 
 **Auto-set security headers:** CSP, HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy.
 
+**Cache-Control:** API responses and anything served to an authorized session are `no-store`; anonymous views and CDN files are `private, max-age=600`.
+
 ---
 
 ## 6. Components
@@ -767,6 +809,7 @@ $request->getPath();              // /api/users/
 $request->getComplexPath();       // /api/users/#POST (for routing)
 $request->getInternalID();        // 8-char hex request ID
 $request->getRemoteAddress();     // Client IP
+$request->getPreferredLanguages(); // ["es", "en"]: "lang" cookie first, then Accept-Language by quality
 
 // Query params (?key=value)
 $value = $request->get("key", SanitizeType::SAFE);
@@ -815,7 +858,7 @@ O(1) hash map for type-safe key-value pairs:
 ```php
 use FastRaven\Components\Data\{Map, Pair};
 
-// Map replaces Collection and uses associative internal storage
+// Map is an associative key-value store
 $map = Map::new([
     "email" => "john@example.com",
     "name" => "John"
@@ -859,32 +902,33 @@ Email configuration for MailService:
 
 ```php
 use FastRaven\Components\Core\Mail;
-use FastRaven\Components\Data\{Collection, Item};
+use FastRaven\Components\Data\{Map, Pair};
 
 $mail = Mail::new(
-    Item::mail("Site Name", "noreply@example.com"),  // From
-    Item::mail("User Name", "user@example.com"),     // To
-    "Welcome to our site!",                          // Subject
+    Pair::mail("Site Name", "noreply@example.com"),  // From
+    Pair::mail("User Name", "user@example.com"),     // To
+    "{{WELCOME_SUBJECT}}",                           // Subject (translated by setLang)
     "welcome.php"                                    // Template in src/web/templates/mails/
 );
 
 // All available setters (chainable)
 $mail
-    ->setOrigin(Item::mail("New Sender", "new@example.com"))
-    ->setDestination(Item::mail("New Recipient", "recipient@example.com"))
+    ->setOrigin(Pair::mail("New Sender", "new@example.com"))
+    ->setDestination(Pair::mail("New Recipient", "recipient@example.com"))
     ->setSubject("Updated Subject")
     ->setBodyFile("other-template.html")
-    ->setReplaceValues(Collection::new([
-        Item::new("{{NAME}}", "John"),
-        Item::new("{{LINK}}", "https://example.com/verify")
+    ->setReplaceValues(Map::new([
+        "{{NAME}}" => "John",
+        "{{LINK}}" => "https://example.com/verify"
     ]))
-    ->setBccMails(Collection::new([
-        Item::mail("Admin", "admin@example.com"),
-        Item::mail("Manager", "manager@example.com")
+    ->setBccMails(Map::new([
+        "Admin" => "admin@example.com",
+        "Manager" => "manager@example.com"
     ]))
-    ->setAttachments(Collection::new([
-        Item::new("invoice.pdf", "/path/to/invoice.pdf")
+    ->setAttachments(Map::new([
+        "invoice.pdf" => "documents/invoice.pdf"     // Relative to storage/uploads/
     ]))
+    ->setLang("es")      // Translate remaining {{KEY}} placeholders
     ->setTimeout(5000);  // Timeout in ms (default: 3000)
 ```
 
@@ -949,6 +993,7 @@ Used with `Bee::buildProjectPath()` for type-safe path construction.
 | `SRC_VIEWS` | `src/views/` |
 | `SRC_API` | `src/api/` |
 | `SRC_CDN` | `src/cdn/` |
+| `SRC_LIB` | `src/lib/` |
 | `SRC_WEB` | `src/web/` |
 | `SRC_WEB_TEMPLATES` | `src/web/templates/` |
 | `SRC_WEB_TEMPLATES_FRAGMENTS` | `src/web/templates/fragments/` |
@@ -957,6 +1002,7 @@ Used with `Bee::buildProjectPath()` for type-safe path construction.
 | `SRC_WEB_ASSETS` | `src/web/assets/` |
 | `SRC_WEB_ASSETS_SCSS` | `src/web/assets/scss/` |
 | `SRC_WEB_ASSETS_JS` | `src/web/assets/js/` |
+| `SRC_WEB_ASSETS_LANG` | `src/web/assets/lang/` |
 | `STORAGE` | `storage/` |
 | `STORAGE_CACHE` | `storage/cache/` |
 | `STORAGE_LOGS` | `storage/logs/` |
@@ -985,6 +1031,7 @@ Input sanitization levels (use with `$request->get()` / `$request->post()`):
 | `EndpointType` | VIEW, API, CDN, ROUTER |
 | `CacheType` | APCU, SHARED, FILE |
 | `QueryType` | SELECT, INSERT, UPDATE, DELETE, COUNT |
+| `OperatorType` | =, !=, >, <, >=, <=, LIKE, NOT LIKE, IN, NOT IN, BETWEEN, NOT BETWEEN, IS, IS NOT |
 | `DataType` | 55+ MIME types (HTML, JSON, PNG, PDF, etc.) |
 | `ValidationType` | MIN_LENGTH, MAX_LENGTH, MIN_DIGITS, MIN_FLOAT, etc. |
 
@@ -1002,13 +1049,15 @@ All exceptions extend `SmartException` with `getStatusCode()`, `getMessage()`, `
 | `NotAuthorizedException(true)` | 401 | Subdomain redirect |
 | `BadMiddlewareException` | 500 | Middleware has incorrect signature |
 | `MiddlewareDeniedException` | 400 | Middleware rejected request |
-| `RateLimitExceededException` | 429 | Rate limit exceeded, includes Retry-After header |
+| `RateLimitExceededException` | 429 | Authorized user exceeded its rate limit, includes Retry-After header |
+| `PayloadTooLargeException` | 413 | Request body exceeds the configured input length limit (multipart uploads excluded) |
 | `BadImplementationException` | 500 | Endpoint doesn't return correct type |
 | `EndpointFileNotFoundException` | 500 | Endpoint file missing |
 | `UploadedFileNotFoundException` | 500 | Uploaded file not in tmp directory |
 | `BadProjectSkeletonException` | 500 | Required project folder missing |
 | `SecurityVulnerabilityException` | 500 | SQL injection detected |
 | `DeveloperException` | 500 | Developer mistake on View/API/CDN endpoints |
+| `UnhandledException` | 500 | Any other Throwable escaping the request lifecycle (logged with file and line) |
 
 ---
 
@@ -1022,21 +1071,21 @@ View endpoints now use PHP handler files that return a `Template` object:
 
 use FastRaven\Components\Core\Template;
 use FastRaven\Components\Http\Request;
-use FastRaven\Components\Data\Item;
 use FastRaven\Services\AuthService;
-use FastRaven\Services\DataService;
+
+use Site\UserRepository;
 
 return function(Request $request, Template $baseTemplate): Template {
-    // Get user data
-    $userId = AuthService::getAuthorizedUserId();
-    $user = DataService::selectOneById("users", ["name", "notifications"], $userId);
+    // Get user data through the site library (src/lib/UserRepository.php)
+    $user = UserRepository::find(AuthService::getAuthorizedUserId());
     
-    // Create page-specific template
-    $page = Template::new("dashboard.php", "Dashboard");
+    // Create page-specific template; $baseTemplate already knows the resolved language
+    $page = Template::new("dashboard.php", $baseTemplate->lang("DASHBOARD_TITLE"));
     
-    // Add dynamic data for the template
+    // Add dynamic data and SEO tags for the template
     $page->addData("username", $user["name"]);
     $page->addData("notifications", $user["notifications"]);
+    $page->addMeta("robots", "noindex");
     
     return $page;
 };
@@ -1044,7 +1093,7 @@ return function(Request $request, Template $baseTemplate): Template {
 
 **Template file** (`src/web/templates/pages/dashboard.php`):
 ```php
-<h1>Welcome, <?= $template->getData("username") ?></h1>
+<h1><?= $template->lang("WELCOME") ?>, <?= $template->getData("username") ?></h1>
 <p>You have <?= $template->getData("notifications") ?> notifications</p>
 
 <!-- Inline script with nonce -->
@@ -1070,8 +1119,8 @@ Complete example of an API endpoint:
 
 use FastRaven\Components\Http\{Request, Response};
 use FastRaven\Services\{AuthService, DataService, ValidationService};
-use FastRaven\Components\Data\{Collection, Item, ValidationFlags};
-use FastRaven\Types\SanitizeType;
+use FastRaven\Components\Data\{Map, ConditionList, Condition};
+use FastRaven\Types\{SanitizeType, ValidationType};
 
 return function(Request $request): Response {
     // Get authenticated user
@@ -1085,7 +1134,7 @@ return function(Request $request): Response {
     $email = $request->post("email", SanitizeType::SAFE);
     
     // Validate input
-    if (!ValidationService::username($name, ValidationFlags::username(3, 50))) {
+    if (!ValidationService::string($name, [ValidationType::MIN_LENGTH->value => 3, ValidationType::MAX_LENGTH->value => 50])) {
         return Response::new(false, 400, "Invalid name");
     }
     if (!ValidationService::email($email)) {
@@ -1093,17 +1142,18 @@ return function(Request $request): Response {
     }
     
     // Check if email already exists
-    $existing = DataService::selectOneWhere("users", ["id"], Collection::new([
-        Item::new("email", $email)
+    $existing = DataService::selectOneWhere("users", ["id"], ConditionList::new([
+        Condition::equals("email", $email),
+        Condition::notEquals("id", $userId)
     ]));
-    if ($existing && $existing["id"] !== $userId) {
+    if ($existing) {
         return Response::new(false, 409, "Email already in use");
     }
     
     // Update user
-    DataService::updateById("users", $userId, Collection::new([
-        Item::new("name", $name),
-        Item::new("email", $email)
+    DataService::updateById("users", $userId, Map::new([
+        "name" => $name,
+        "email" => $email
     ]));
     
     return Response::new(true, 200, "Profile updated");
@@ -1182,6 +1232,8 @@ return $adminRouter;
 - `GET /api/admin/users/` → `admin/Users.php` (restricted)
 - `POST /api/admin/ban/` → `admin/Ban.php` (restricted)
 
+The `restricted` flag and the middleware of the router endpoint are enforced before the nested router file is loaded, so an anonymous request to any `/api/admin/*` path gets a 401.
+
 ---
 
 ## 13. Error Handling
@@ -1231,6 +1283,7 @@ $config->configureRedirects(null, "/login", null);
 **Notes:**
 - Error pages only apply to VIEW endpoints (API/CDN always return JSON/file responses)
 - Redirects take precedence over error pages when configured (returns 302 redirect)
+- A redirect pointing at the page that just failed is skipped and the error page is shown instead, so a denied or restricted `/` or `/login` never loops
 - Default error page is `errors/generic.php` if no custom page is set via `setErrorFile()`
 - Error pages receive the base template
 
@@ -1308,6 +1361,13 @@ Lib.request("/api/user/update/", "POST", { name: "John" })
     .then(res => console.log(res));
 ```
 
+### Lib.changeLanguage()
+
+```javascript
+Lib.changeLanguage("es");      // Persists the "lang" cookie, swaps [data-lang] elements, updates <html lang>
+Lib.CURRENT_LANGUAGE;          // Language the page was rendered in
+```
+
 ### Lib.uploadFile()
 
 ```javascript
@@ -1339,7 +1399,37 @@ return function(Request $request): Response {
 
 ---
 
-## 15. Shared Classes
+## 15. Site Libraries & Shared Classes
+
+### Site libraries (`src/lib/`)
+
+Logic that belongs to one site but is shared between its endpoints (repositories, services, helpers) lives in `src/lib/` under the `Site\` namespace. The framework autoloads it with no configuration: `Site\User\Repository` maps to `src/lib/User/Repository.php`. Endpoints stay one-screen long and testable.
+
+```php
+// src/lib/UserRepository.php
+namespace Site;
+
+use FastRaven\Services\DataService;
+
+final class UserRepository {
+    public static function find(int $id): ?array {
+        return DataService::selectOneById("users", ["id", "name", "notifications"], $id);
+    }
+
+    public static function emailTaken(string $email, int $exceptId): bool {
+        return DataService::sqlValue("SELECT 1 FROM users WHERE email = ? AND id != ? LIMIT 1", [$email, $exceptId]) !== null;
+    }
+}
+```
+
+```php
+// Usage in any endpoint or middleware of the site
+use Site\UserRepository;
+
+$user = UserRepository::find(AuthService::getAuthorizedUserId());
+```
+
+### Shared classes (`shared/`)
 
 Create reusable classes in `shared/` available across all sites via the `Shared\` namespace:
 
@@ -1369,10 +1459,10 @@ $price = HelperClass::formatCurrency(99.99);  // "99,99 €"
 framework/src/
 ├── Components/           # Public components
 │   ├── Core/             Config, Template, Mail, File
-│   ├── Data/             Collection, Item, ValidationFlags
+│   ├── Data/             Map, Pair, Condition, ConditionList
 │   ├── Http/             Request, Response
 │   └── Routing/          Router, Endpoint, Middleware
-├── Exceptions/           # SmartException and 11 subclasses
+├── Exceptions/           # SmartException and 13 subclasses
 ├── Internals/             # Kernel, Engines (not for direct use)
 ├── Services/              # Public API (9 services)
 │   ├── AuthService.php
@@ -1383,7 +1473,7 @@ framework/src/
 │   ├── LogService.php
 │   ├── MailService.php
 │   └── ValidationService.php
-├── Types/                # Enums (6 types)
+├── Types/                # Enums (8 types)
 ├── Bee.php               # Utilities
 └── Server.php            # Entry point
 ```
