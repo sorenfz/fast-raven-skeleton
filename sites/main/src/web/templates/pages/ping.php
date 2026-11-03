@@ -1,6 +1,7 @@
-<h2 data-lang="FR_PING_EXAMPLE"></h2>
+<h2 data-lang="FR_PING_EXAMPLE"><?= $template->lang("FR_PING_EXAMPLE"); ?></h2>
 <h4>PING -> <span id="pong-answer"></span></h4>
 <p><?= $template->getData("test"); ?></p>
+<button onclick="Lib.changeLanguage(Lib.CURRENT_LANGUAGE === 'en' ? 'es' : 'en')">Switch language</button>
 
 <script nonce="<?= $template->getNonce(); ?>">
     // Avoid using inline-scripts, this is just an example.

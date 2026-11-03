@@ -91,6 +91,11 @@ sudo tee "$SITE_CONFIG" > /dev/null <<EOF
         AllowOverride All
         Require all granted
     </Directory>
+
+    # Never serve site internals directly, even if the rewrite rules are off.
+    <DirectoryMatch "^${WWW_LINK}/${SITE_FOLDER}/(config|src|storage)/">
+        Require all denied
+    </DirectoryMatch>
     
     # SSL Configuration
     SSLEngine on
